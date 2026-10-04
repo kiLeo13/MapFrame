@@ -17,6 +17,7 @@ import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.saveddata.maps.MapId;
 import net.minecraft.world.level.saveddata.maps.MapItemSavedData;
+import utils.mapframe.config.UpdateMode;
 
 public final class MapFrameGameTest implements CustomTestMethodInvoker {
     @GameTest(maxTicks = 200)
@@ -54,6 +55,65 @@ public final class MapFrameGameTest implements CustomTestMethodInvoker {
         helper.succeed();
     }
 
+    @GameTest(maxTicks = 200)
+    public void loadedChunksUpdateWithoutPlayerInMapArea(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        BlockPos framePos = helper.absolutePos(new BlockPos(2, 2, 2));
+        BlockPos mapOrigin = new BlockPos(200_000, 64, 200_000);
+        level.setBlockAndUpdate(framePos.relative(Direction.NORTH), Blocks.STONE.defaultBlockState());
+
+        ItemStack mapStack = MapItem.create(level, mapOrigin.getX(), mapOrigin.getZ(), (byte) 0, true, false);
+        MapId mapId = mapStack.get(DataComponents.MAP_ID);
+        helper.assertTrue(mapId != null, "Created map must have an id");
+        MapItemSavedData data = level.getMapData(mapId);
+        helper.assertTrue(data != null, "Created map data must be registered");
+
+        int firstPixelX = data.centerX - 64;
+        int firstPixelZ = data.centerZ - 64;
+        level.getChunk(firstPixelX >> 4, firstPixelZ >> 4);
+
+        ItemFrame frame = new ItemFrame(level, framePos, Direction.SOUTH);
+        frame.setItem(mapStack);
+        helper.assertTrue(level.addFreshEntity(frame), "Item frame must be added to the test level");
+
+        MapFrameUpdateService service = new MapFrameUpdateService(UpdateMode.LOADED_CHUNKS);
+        service.onEntityLoaded(frame, level);
+        for (int i = 0; i < 20; i++) {
+            service.tick(level.getServer());
+        }
+
+        helper.assertTrue(Arrays.stream(toInts(data.colors)).anyMatch(color -> color != 0),
+                "Loaded terrain must update without a player inside the map area");
+        helper.succeed();
+    }
+
+    @GameTest(maxTicks = 100)
+    public void loadedChunksModeDoesNotLoadTerrain(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        BlockPos framePos = helper.absolutePos(new BlockPos(2, 2, 2));
+        level.setBlockAndUpdate(framePos.relative(Direction.NORTH), Blocks.STONE.defaultBlockState());
+
+        ItemStack mapStack = MapItem.create(level, 1_000_000, 1_000_000, (byte) 0, true, false);
+        MapId mapId = mapStack.get(DataComponents.MAP_ID);
+        helper.assertTrue(mapId != null, "Created map must have an id");
+        MapItemSavedData data = level.getMapData(mapId);
+        helper.assertTrue(data != null, "Created map data must be registered");
+        assertCoverageUnloaded(helper, level, data, "Remote map coverage must begin unloaded");
+
+        ItemFrame frame = new ItemFrame(level, framePos, Direction.SOUTH);
+        frame.setItem(mapStack);
+        helper.assertTrue(level.addFreshEntity(frame), "Item frame must be added to the test level");
+
+        MapFrameUpdateService service = new MapFrameUpdateService(UpdateMode.LOADED_CHUNKS);
+        service.onEntityLoaded(frame, level);
+        for (int i = 0; i < 20; i++) {
+            service.tick(level.getServer());
+        }
+
+        assertCoverageUnloaded(helper, level, data, "MapFrame must not load terrain while sampling");
+        helper.succeed();
+    }
+
     @Override
     public void invokeTestMethod(GameTestHelper helper, Method method) throws ReflectiveOperationException {
         method.invoke(this, helper);
@@ -65,6 +125,24 @@ public final class MapFrameGameTest implements CustomTestMethodInvoker {
         for (int chunkX = centerChunkX - 9; chunkX <= centerChunkX + 9; chunkX++) {
             for (int chunkZ = centerChunkZ - 9; chunkZ <= centerChunkZ + 9; chunkZ++) {
                 level.getChunk(chunkX, chunkZ);
+            }
+        }
+    }
+
+    private static void assertCoverageUnloaded(
+            GameTestHelper helper,
+            ServerLevel level,
+            MapItemSavedData data,
+            String message
+    ) {
+        int blocksPerPixel = 1 << data.scale;
+        int minChunkX = (data.centerX - 64 * blocksPerPixel) >> 4;
+        int maxChunkX = (data.centerX + 64 * blocksPerPixel - 1) >> 4;
+        int minChunkZ = (data.centerZ - 64 * blocksPerPixel) >> 4;
+        int maxChunkZ = (data.centerZ + 64 * blocksPerPixel - 1) >> 4;
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+                helper.assertTrue(!level.hasChunk(chunkX, chunkZ), message);
             }
         }
     }

@@ -20,14 +20,15 @@ import net.minecraft.world.item.MapItem;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.saveddata.maps.MapId;
 import net.minecraft.world.level.saveddata.maps.MapItemSavedData;
+import utils.mapframe.config.UpdateMode;
 
 /**
- * Tracks maps in loaded item frames and incrementally invokes Minecraft's native map sampler.
+ * Tracks maps in loaded item frames and incrementally samples their loaded terrain.
  * All methods run on the server thread; no world state is accessed asynchronously.
  */
 public final class MapFrameUpdateService {
     private static final int MAX_FRAME_SCANS_PER_TICK = 128;
-    private static final int MAX_UPDATES_PER_TICK = 4;
+    private static final int UPDATE_INTERVAL_TICKS = 2;
     private static final int UPDATE_QUEUE_CAPACITY = 4096;
     private static final long MILLIS_IN_NANOS = 1_000_000L;
     private static final TickBudget TICK_BUDGET = new TickBudget(
@@ -40,7 +41,18 @@ public final class MapFrameUpdateService {
     private final ArrayDeque<UUID> frameScanQueue = new ArrayDeque<>();
     private final Map<MapId, ActiveMap> activeMaps = new HashMap<>();
     private final SpatialMapIndex<ResourceKey<Level>, MapId> spatialIndex = new SpatialMapIndex<>();
-    private final CoalescingQueue<MapUpdateJob> updateQueue = new CoalescingQueue<>(UPDATE_QUEUE_CAPACITY);
+    private final CoalescingQueue<PlayerMapUpdateJob> playerUpdateQueue = new CoalescingQueue<>(UPDATE_QUEUE_CAPACITY);
+    private final CoalescingQueue<LoadedMapUpdateJob> loadedUpdateQueue = new CoalescingQueue<>(UPDATE_QUEUE_CAPACITY);
+    private final UpdateMode updateMode;
+    private final TickCadence updateCadence = new TickCadence(UPDATE_INTERVAL_TICKS);
+
+    public MapFrameUpdateService() {
+        this(UpdateMode.PLAYER_PROXIMITY);
+    }
+
+    public MapFrameUpdateService(UpdateMode updateMode) {
+        this.updateMode = Objects.requireNonNull(updateMode, "updateMode");
+    }
 
     public void onEntityLoaded(Entity entity, ServerLevel level) {
         if (!(entity instanceof ItemFrame frame)) {
@@ -64,6 +76,9 @@ public final class MapFrameUpdateService {
 
     public void tick(MinecraftServer server) {
         refreshFrames();
+        if (!updateCadence.advance()) {
+            return;
+        }
         enqueueUpdates(server);
         processUpdates(server);
     }
@@ -73,7 +88,9 @@ public final class MapFrameUpdateService {
         frameScanQueue.clear();
         activeMaps.clear();
         spatialIndex.clear();
-        updateQueue.clear();
+        playerUpdateQueue.clear();
+        loadedUpdateQueue.clear();
+        updateCadence.reset();
     }
 
     private void refreshFrames() {
@@ -153,12 +170,19 @@ public final class MapFrameUpdateService {
     }
 
     private void enqueueUpdates(MinecraftServer server) {
+        if (updateMode == UpdateMode.LOADED_CHUNKS) {
+            for (Map.Entry<MapId, ActiveMap> entry : activeMaps.entrySet()) {
+                loadedUpdateQueue.offer(new LoadedMapUpdateJob(entry.getValue().coverage.dimension(), entry.getKey()));
+            }
+            return;
+        }
+
         for (ServerLevel level : server.getAllLevels()) {
             for (ServerPlayer player : level.players()) {
                 Set<MapId> nearbyMaps = spatialIndex.query(level.dimension(), player.getX(), player.getZ());
                 for (MapId mapId : nearbyMaps) {
                     if (!isHoldingMap(player, mapId)) {
-                        updateQueue.offer(new MapUpdateJob(level.dimension(), mapId, player.getUUID()));
+                        playerUpdateQueue.offer(new PlayerMapUpdateJob(level.dimension(), mapId, player.getUUID()));
                     }
                 }
             }
@@ -171,35 +195,58 @@ public final class MapFrameUpdateService {
             return;
         }
 
-        long startedAt = System.nanoTime();
-        int attempts = 0;
-        while (attempts < MAX_UPDATES_PER_TICK && (attempts == 0 || System.nanoTime() - startedAt < budgetNanos)) {
-            MapUpdateJob job = updateQueue.poll();
-            if (job == null) {
-                return;
-            }
-            attempts++;
-            processUpdate(server, job);
+        if (updateMode == UpdateMode.LOADED_CHUNKS) {
+            processLoadedChunkUpdate(server);
+        } else {
+            processPlayerUpdate(server);
         }
     }
 
-    private boolean processUpdate(MinecraftServer server, MapUpdateJob job) {
+    private boolean processPlayerUpdate(MinecraftServer server) {
+        PlayerMapUpdateJob job = playerUpdateQueue.poll();
+        if (job == null) {
+            return false;
+        }
         ActiveMap activeMap = activeMaps.get(job.mapId());
         ServerLevel level = server.getLevel(job.dimension());
         ServerPlayer player = server.getPlayerList().getPlayer(job.playerId());
         if (activeMap == null || level == null || player == null || player.level() != level || player.isRemoved()) {
-            return false;
+            return true;
         }
         if (!activeMap.coverage.contains(player.getX(), player.getZ()) || isHoldingMap(player, job.mapId())) {
-            return false;
+            return true;
         }
 
         MapItemSavedData data = level.getMapData(job.mapId());
         if (data == null || data.locked || !isSamplingAreaLoaded(level, player, data)) {
-            return false;
+            return true;
         }
 
         ((MapItem) Items.FILLED_MAP).update(level, player, data);
+        return true;
+    }
+
+    private boolean processLoadedChunkUpdate(MinecraftServer server) {
+        LoadedMapUpdateJob job = loadedUpdateQueue.poll();
+        if (job == null) {
+            return false;
+        }
+
+        ActiveMap activeMap = activeMaps.get(job.mapId());
+        ServerLevel level = server.getLevel(job.dimension());
+        if (activeMap == null || level == null) {
+            return true;
+        }
+
+        MapItemSavedData data = level.getMapData(job.mapId());
+        if (data == null || data.locked) {
+            return true;
+        }
+
+        int imageX = activeMap.pixelCursor.imageX();
+        int imageZ = activeMap.pixelCursor.imageZ();
+        LoadedChunkMapSampler.updatePixel(level, data, imageX, imageZ);
+        activeMap.pixelCursor.advance();
         return true;
     }
 
@@ -264,6 +311,7 @@ public final class MapFrameUpdateService {
 
     private static final class ActiveMap {
         private final MapCoverage<ResourceKey<Level>> coverage;
+        private final MapPixelCursor pixelCursor = new MapPixelCursor();
         private int references = 1;
 
         private ActiveMap(MapCoverage<ResourceKey<Level>> coverage) {
@@ -271,6 +319,9 @@ public final class MapFrameUpdateService {
         }
     }
 
-    private record MapUpdateJob(ResourceKey<Level> dimension, MapId mapId, UUID playerId) {
+    private record PlayerMapUpdateJob(ResourceKey<Level> dimension, MapId mapId, UUID playerId) {
+    }
+
+    private record LoadedMapUpdateJob(ResourceKey<Level> dimension, MapId mapId) {
     }
 }
