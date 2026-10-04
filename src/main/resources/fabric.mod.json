@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "mapframe",
+  "version": "${version}",
+  "name": "MapFrame",
+  "description": "A mod to make maps update near realtime on ItemFrames.",
+  "authors": [],
+  "contact": {},
+  "license": "MIT",
+  "icon": "assets/mapframe/icon.png",
+  "environment": "server",
+  "entrypoints": {
+    "fabric-datagen": [
+      "utils.mapframe.client.MapframeDataGenerator"
+    ],
+    "main": [
+      "utils.mapframe.Mapframe"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "fabric-api": "*",
+    "minecraft": "${minecraft_version}"
+  }
+}
