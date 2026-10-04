@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Visual Studio Code
+.vscode/
+
+# Local Minecraft runs
+run/
+logs/
+crash-reports/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
